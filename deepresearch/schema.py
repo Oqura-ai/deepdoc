@@ -1,6 +1,6 @@
-from typing import TypedDict, List, Annotated, Literal, Union
+from typing import TypedDict, List, Annotated, Literal, Optional
 from pydantic import BaseModel, Field
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage
 import operator
 
 class Section(BaseModel):
@@ -20,8 +20,25 @@ class SearchResult(BaseModel):
     query: Query = Field(..., description="The search query that was used to retrieve the raw content")
     raw_content: list[str] = Field(..., description="The raw content retrieved from the search")
 
-class Feedback(BaseModel):
-    feedback: Union[str, bool] = Field(..., description="Feedback on the report structure. If the content is good for the section, return True (boolean), otherwise return a string of feedback on what is missing or incorrect.")
+class RetrievedPassage(BaseModel):
+    point_id: str
+    query: Query
+    filename: str
+    page_number: int
+    chunk_id: str
+    page_content: str
+    qdrant_score: Optional[float] = None
+
+class EvidenceScores(BaseModel):
+    relevance: float
+    usable_evidence: float
+    contradicts_query: float
+    prompt_injection: float
+
+class EvidenceDecision(BaseModel):
+    passage: RetrievedPassage
+    scores: EvidenceScores
+    route: Literal["include", "conflicting_evidence", "exclude"]
 
 class SectionOutput(BaseModel):
     final_section_content: List[str] = Field(..., description="The final section content")
@@ -39,10 +56,13 @@ class AgentState(TypedDict):
 class ResearchState(TypedDict):
     section: Section
     knowledge: str
-    reflection_feedback: Feedback = Feedback(feedback="")
+    reflection_feedback: str
     generated_queries: List[Query] = []
     searched_queries: Annotated[List[Query], operator.add] = []
+    retrieved_passages: List[RetrievedPassage] = []
     search_results: Annotated[List[SearchResult], operator.add] = []
+    evidence_decisions: Annotated[List[EvidenceDecision], operator.add] = []
     accumulated_content: str = ""
-    reflection_count: int = 1
+    reflection_count: int = 0
+    reflection_scores: dict[str, float]
     final_section_content: Annotated[List[str], operator.add] = []

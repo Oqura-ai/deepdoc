@@ -18,3 +18,4 @@ rich==14.1.0
 pyfiglet==1.0.3
 pdfplumber
 reportlab
+typesafe-sdk==0.7.1

@@ -14,6 +14,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph
 from reportlab.lib.styles import getSampleStyleSheet
 
 from deepresearch.graph import graph
+from deepresearch.jev_integration import JevConfigurationError, validate_jev_configuration
 
 console = Console()
 
@@ -31,6 +32,7 @@ def render_banner(title: str = "DeepDoc.ai", subtitle: str = ""):
     console.print(panel)
 
 def run_tool(topic, outline, resource_path, config):
+    validate_jev_configuration()
     for event in graph.stream(
         {"topic": topic, "outline": outline, "resource_path": resource_path},
         config=config,
@@ -81,6 +83,12 @@ if __name__ == "__main__":
     from configuration import THREAD_CONFIG
     
     render_banner("DeepDoc.ai", "AI-powered Local Deep Research")
+
+    try:
+        validate_jev_configuration()
+    except JevConfigurationError as exc:
+        console.print(Panel(str(exc), title="JEV CONFIGURATION", style="bold red", width=120))
+        raise SystemExit(1)
 
     topic = Prompt.ask("[bold yellow]Enter your topic[/bold yellow]").strip()
     outline = Prompt.ask("[bold yellow]Enter your outline or goal[/bold yellow]").strip()

@@ -1,22 +1,40 @@
-from langchain_core.messages import BaseMessage, HumanMessage
+from typing import Literal
+
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts import SystemMessagePromptTemplate, HumanMessagePromptTemplate, ChatPromptTemplate, MessagesPlaceholder
-import operator
 
 from langgraph.types import Command, Send
 
 from deepresearch.prompts import *
 from deepresearch.client_init import init_llm
 from deepresearch.chunk_prep import create_chunks
+from deepresearch.jev_integration import (
+    build_reflection_feedback,
+    evaluate_passages,
+    evaluate_subsection_coverage,
+    format_evidence,
+    missing_subsections,
+    select_evidence,
+)
 from deepresearch.qdrant_setup import rag_pipeline_setup, retrieve_from_store
-from deepresearch.schema import AgentState, ResearchState, Sections, Literal, Queries, SearchResult, Feedback
+from deepresearch.schema import (
+    AgentState,
+    ResearchState,
+    Sections,
+    Queries,
+    RetrievedPassage,
+    SearchResult,
+)
 
 from configuration import LLM_CONFIG
 
 llm = init_llm(
     provider=LLM_CONFIG["provider"],
     model=LLM_CONFIG["model"],
-    temperature=LLM_CONFIG["temperature"]
+    temperature=LLM_CONFIG["temperature"],
+    max_retries=LLM_CONFIG.get("max_retries", 6),
+    timeout=LLM_CONFIG.get("timeout", 120.0),
 )
 
 def resource_setup_node(state: AgentState, config: RunnableConfig):
@@ -65,7 +83,10 @@ def section_formatter_node(state: AgentState, config: RunnableConfig) -> Command
         HumanMessagePromptTemplate.from_template(template="{report_structure}"),
     ])
 
-    section_formatter_llm = section_formatter_system_prompt | llm.with_structured_output(Sections)
+    section_formatter_llm = section_formatter_system_prompt | llm.with_structured_output(
+        Sections,
+        method="function_calling",
+    )
     result = section_formatter_llm.invoke(state)
     return Command(
         update={"sections": result.sections},
@@ -97,32 +118,70 @@ def query_generator_node(state: ResearchState, config: RunnableConfig):
         HumanMessagePromptTemplate.from_template(template="Section: {section}\nPrevious Queries: {searched_queries}\nReflection Feedback: {reflection_feedback}"),
     ])
 
-    query_generator_llm = query_generator_system_prompt | llm.with_structured_output(Queries)
-    state.setdefault("reflection_feedback", "")
-    state.setdefault("searched_queries", [])
-    configurable = config.get("configurable")
+    query_generator_llm = query_generator_system_prompt | llm.with_structured_output(
+        Queries,
+        method="function_calling",
+    )
+    configurable = config.get("configurable") or {}
 
     input_data = {
         **state,
+        "reflection_feedback": state.get("reflection_feedback", ""),
+        "searched_queries": state.get("searched_queries", []),
         **configurable  # includes max_queries, search_depth, etc.
     }
 
-    result = query_generator_llm.invoke(input_data, configurable)
-    return {"generated_queries": result.queries, "searched_queries": result.queries}
+    result = query_generator_llm.invoke(input_data, config)
+    queries = result.queries[: configurable.get("max_queries", 3)]
+    return {"generated_queries": queries, "searched_queries": queries}
 
 
 def rag_search_node(state: ResearchState, config: RunnableConfig):
     queries = state["generated_queries"]
-    configurable = config.get("configurable")
-    search_results = []
+    configurable = config.get("configurable") or {}
+    retrieved_passages = []
     for query in queries:
-        raw_content = []
-        response = retrieve_from_store(query.query, configurable.get("thread_id"), configurable.get("n_points"))
+        response = retrieve_from_store(
+            query.query,
+            configurable.get("thread_id"),
+            configurable.get("n_points", 6),
+        )
         for result in response:
-            content = f"filename:{result.payload['document']['filename']}\nPage_number:{result.payload['document']['page_number']}\nPage_Content: {result.payload['document']["page_content"]}\n\n\n"
-            raw_content.append(content)
-        search_results.append(SearchResult(query=query, raw_content=raw_content))
-    return {"search_results": search_results}
+            document = result.payload["document"]
+            retrieved_passages.append(
+                RetrievedPassage(
+                    point_id=str(result.id),
+                    query=query,
+                    filename=document["filename"],
+                    page_number=document["page_number"],
+                    chunk_id=document.get("chunk_id", str(result.id)),
+                    page_content=document["page_content"],
+                    qdrant_score=getattr(result, "score", None),
+                )
+            )
+    return {"retrieved_passages": retrieved_passages}
+
+
+def evidence_gate_node(state: ResearchState, config: RunnableConfig):
+    configurable = config.get("configurable") or {}
+    decisions = evaluate_passages(state.get("retrieved_passages", []), configurable)
+    selected = select_evidence(
+        decisions,
+        keep_per_query=configurable.get("evidence_keep_per_query", 3),
+    )
+
+    by_query = {}
+    for decision in selected:
+        by_query.setdefault(decision.passage.query.query, []).append(format_evidence(decision))
+
+    search_results = [
+        SearchResult(query=query, raw_content=by_query.get(query.query, []))
+        for query in state["generated_queries"]
+    ]
+    return {
+        "search_results": search_results,
+        "evidence_decisions": decisions,
+    }
 
 
 def result_accumulator_node(state: ResearchState, config: RunnableConfig):
@@ -137,36 +196,52 @@ def result_accumulator_node(state: ResearchState, config: RunnableConfig):
 
 
 def reflection_feedback_node(state: ResearchState, config: RunnableConfig) -> Command[Literal["final_section_formatter", "query_generator"]]:
-    reflection_feedback_system_prompt = ChatPromptTemplate.from_messages([
-        SystemMessagePromptTemplate.from_template(REFLECTION_FEEDBACK_SYSTEM_PROMPT_TEMPLATE),
-        HumanMessagePromptTemplate.from_template(template="Section: {section}\nAccumulated Content: {accumulated_content}"),
-    ])
-
-    reflection_feedback_llm = reflection_feedback_system_prompt | llm.with_structured_output(Feedback)
     reflection_count = state.get("reflection_count", 0)
-    configurable = config.get("configurable")
-    result = reflection_feedback_llm.invoke(state)
-    feedback = result.feedback
-    if (feedback == True) or (feedback.lower() == "true") or (reflection_count < configurable.get("num_reflections")):
+    configurable = config.get("configurable") or {}
+    coverage = evaluate_subsection_coverage(
+        state["section"],
+        state.get("accumulated_content", ""),
+    )
+    missing = missing_subsections(
+        state["section"],
+        coverage,
+        threshold=configurable.get("jev_reflection_threshold", 0.70),
+    )
+    feedback = build_reflection_feedback(missing)
+
+    if not missing or reflection_count >= configurable.get("num_reflections", 2):
         return Command(
-            update={"reflection_feedback": feedback},
+            update={
+                "reflection_feedback": feedback,
+                "reflection_scores": coverage,
+            },
             goto="final_section_formatter"
         )
-    else:
-        return Command(
-            update={"reflection_feedback": feedback, "reflection_count": reflection_count + 1},
-            goto="query_generator"
-        )
+
+    return Command(
+        update={
+            "reflection_feedback": feedback,
+            "reflection_scores": coverage,
+            "reflection_count": reflection_count + 1,
+        },
+        goto="query_generator"
+    )
     
 
 def final_section_formatter_node(state: ResearchState, config: RunnableConfig):
     final_section_formatter_system_prompt = ChatPromptTemplate.from_messages([
         SystemMessagePromptTemplate.from_template(FINAL_SECTION_FORMATTER_SYSTEM_PROMPT_TEMPLATE),
-        HumanMessagePromptTemplate.from_template(template="Internal Knowledge: {knowledge}\nSearch Result content: {accumulated_content}"),
+        HumanMessagePromptTemplate.from_template(
+            template=(
+                "Internal Knowledge: {knowledge}\n"
+                "Accepted Local-Document Evidence: {search_results}\n"
+                "Curated Evidence: {accumulated_content}"
+            )
+        ),
     ])
 
     final_section_formatter_llm = final_section_formatter_system_prompt | llm
-    result = final_section_formatter_llm.invoke(state)
+    result = final_section_formatter_llm.invoke(state, config)
     return {"final_section_content": [result.content]}
 
 

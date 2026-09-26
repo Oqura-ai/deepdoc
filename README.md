@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/github/last-commit/Oqura-ai/deepdoc?style=flat-square&color=blue" alt="Last Commit">
 </a>
 
-<img src="https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square" alt="Python Version">
+<img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=flat-square" alt="Python Version">
 
 <a href="https://github.com/Oqura-ai/deepdoc/graphs/contributors">
   <img src="https://img.shields.io/github/contributors/Oqura-ai/deepdoc?style=flat-square&color=yellow" alt="Contributors">
@@ -33,25 +33,35 @@
 
 ## Overview
 
-Oqura's deepdoc is a tool that performs deep research on your local resources instead of the internet. It uses a research-style workflow to explore your documents, organize the findings, and generate a clear markdown report. This way, you can quickly uncover insights from your own files without manually digging through them.
+Oqura's deepdoc is a local deep-research tool that turns your own files into a
+structured Markdown report. It extracts and indexes the content, plans the report,
+researches every section against the local collection, and combines the results into
+one final document.
+
+DeepDoc uses TypeSafe's Jev model to improve the research process without replacing
+the generative LLM. Jev checks and reranks the chunks returned by Qdrant, then checks
+whether the collected evidence covers every required subsection. The configured LLM
+still handles planning, query generation, synthesis, and report writing, while Python
+uses Jev's probabilities to make explicit filtering and retry decisions.
 
 
-## How It Works  
+## How It Works
 
-- Start by uploading local resources (PDF, DOCX, JPG, TXT, etc.).  
-- The system extracts text and splits it into page-wise chunks.  
-- These chunks are stored in a vector database for semantic similarity search.  
-- Based on your instruction query, a content structure is generated.  
-- You can provide feedback to refine the structure.  
-- The tool then generates report sections and section topics.  
-- For each section, research agents:  
-  - Generate knowledge for the section.  
-  - Create research queries.  
-  - Run search agents over the chunked local data.  
-  - Use reflection agents to refine results.  
-  - Generate final section content.  
-- Section-wise content is compiled and passed to a final report writer.  
-- The output is a complete, structured report in markdown format.  
+- Provide a directory containing PDF, DOCX, PPTX, image, TXT, or Markdown resources.
+- DeepDoc extracts the text, keeps page and source metadata, and creates searchable
+  chunks in Qdrant.
+- A report planner creates the initial structure from your topic and outline. You can
+  approve it or request changes before research starts.
+- One research agent runs for every report section. Each agent:
+  - Generates focused research queries.
+  - Retrieves a shortlist of candidate chunks from Qdrant.
+  - Uses Jev to judge relevance, usable evidence, contradiction, and
+    prompt-injection-like content.
+  - Filters and reranks the candidates before evidence reaches the writing LLM.
+  - Uses Jev reflection scores to find subsections that still lack evidence.
+  - Generates new queries for missing coverage, up to the configured reflection limit.
+  - Writes the completed section from the accepted local evidence.
+- The final report writer combines all completed sections and exports a Markdown file.
 
 
 ## Workflow  
@@ -59,6 +69,21 @@ Oqura's deepdoc is a tool that performs deep research on your local resources in
 This diagram shows how Local DeepResearcher takes your local resources and instructions, processes and analyzes the content, and turns it into a structured report.  
 
 ![Deep Research Workflow](./assets/workflow.png)
+
+Inside each parallel research agent, the implemented path is:
+
+```text
+Query generation
+  -> Qdrant retrieval
+  -> Jev evidence gate and reranker
+  -> Evidence accumulator
+  -> Jev subsection coverage reflection
+       -> Query generation again when coverage is missing and retries remain
+       -> Section writer when coverage is sufficient or the retry limit is reached
+```
+
+Jev returns typed probabilities; thresholds, ranking, retry limits, and graph routing
+remain ordinary Python logic in the application.
 
 
 ---
@@ -110,12 +135,18 @@ Copy the example `.env` file and add your API keys:
 cp .env.example .env
 ```
 
-Open the `.env` file in a text editor and fill in the required fields:
+Open the `.env` file in a text editor and fill in the keys used by your configuration.
+`OPENAI_API_KEY` and `TYPESAFE_API_KEY` are required for the default setup:
 
 ```
 MISTRAL_API_KEY=
 TAVILY_API_KEY=
 OPENAI_API_KEY=
+TYPESAFE_API_KEY=
+
+# Jev / TypeSafe defaults
+TYPESAFE_DEFAULT_MODEL=jev-latest
+TYPESAFE_LOG_LEVEL=warning
 
 # Default
 QDRANT_URL=http://localhost:6333
@@ -124,7 +155,12 @@ EMBEDDING_MODEL=BAAI/bge-small-en-v1.5
 QDRANT_DISABLE_THREADING=true # Don't change this
 ```
 
-These keys are essential for the application to work correctly.
+Create a TypeSafe API key in the [TypeSafe console](https://console.typesafe.ai/) and
+put it in `TYPESAFE_API_KEY`. Keep `.env` local and never commit the real key.
+
+`TYPESAFE_DEFAULT_MODEL=jev-latest` follows the newest stable Jev release. After you
+calibrate thresholds for production, pin a versioned Jev model if you need completely
+repeatable behavior across future releases.
 
 ### 5. Install Dependencies
 
@@ -134,7 +170,7 @@ Install required packages using:
 uv pip install -r requirements.txt
 ```
 
-### 5. Set Up Docker for Qdrant vectorDB
+### 6. Set Up Qdrant with Docker
 
 Make sure you have Docker and Docker Compose installed. Then start the required services (e.g., Qdrant) using:
 
@@ -142,9 +178,9 @@ Make sure you have Docker and Docker Compose installed. Then start the required 
 docker-compose up --build
 ```
 
-This will spin up the necessary services in the background.
+This starts the Qdrant service used for local vector search.
 
-### 6. Run the Application
+### 7. Run the Application
 
 Once the environment and services are ready, start the application:
 
@@ -152,11 +188,13 @@ Once the environment and services are ready, start the application:
 python main.py
 ```
 
-You're all set to go! The application will now guide you through the dataset creation process step by step and the final dataset will be saved in the output_files directory.
+The CLI will ask for a topic, an outline or goal, and the local resource directory.
+Completed reports are saved in `output_folder`.
 
 ### Optional: `configuration.py`
 
-You can customize how the tool behaves using the `configuration.py` file. It lets you adjust 2 parameters for this application.
+You can customize model behavior, parallelism, retrieval size, reflection limits, and
+Jev thresholds in `configuration.py`.
 
 ```python
 import uuid
@@ -165,18 +203,42 @@ LLM_CONFIG = {
     "provider": "openai",
     "model": "gpt-4o-mini", 
     "temperature": 0.5,
+    "max_retries": 6,
+    "timeout": 120.0,
 }
 
 THREAD_CONFIG = {
+    # Limit simultaneous section branches to reduce provider token bursts.
+    "max_concurrency": 2,
     "configurable": {
         "thread_id": str(uuid.uuid4()),
         "max_queries": 3,
         "search_depth": 2,
         "num_reflections": 2,
-        "n_points": 1,
+        "n_points": 6,
+        "evidence_keep_per_query": 3,
+        "jev_relevance_threshold": 0.45,
+        "jev_evidence_threshold": 0.55,
+        "jev_contradiction_threshold": 0.70,
+        "jev_injection_threshold": 0.70,
+        "jev_reflection_threshold": 0.70,
     }
 }
 ```
+
+The Jev thresholds are starting points rather than universal constants. Evaluate them
+on representative local documents before changing them. Increasing `n_points` can
+improve candidate recall, but it also creates more Jev evaluations because every
+query/chunk pair is judged independently. `evidence_keep_per_query` controls how many
+of those candidates continue to the evidence accumulator.
+
+`max_retries` handles temporary model-provider errors such as HTTP 429 responses.
+`max_concurrency` limits how many report sections research in parallel; lower it to
+`1` for the most conservative token usage, or raise it only when your provider
+limits have enough headroom.
+
+Jev requests use a bounded retry policy for temporary 429/5xx, connection, and
+timeout failures.
 
 ## Authors
 
